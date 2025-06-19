@@ -1,2 +1,242 @@
-# cave-PY
-A QGIS plugin to identify cave levels from geospatially referenced cave surveys
+from qgis.core import (QgsProcessing,
+                       QgsProcessingAlgorithm,
+                       QgsProcessingParameterFeatureSource,
+                       QgsProcessingParameterNumber,
+                       QgsProcessingParameterField,
+                       QgsProcessingParameterBoolean,
+                       QgsProcessingParameterFileDestination,
+                       QgsProcessingException)
+from qgis.PyQt.QtCore import QCoreApplication
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+
+class CalculateCaveLevelsAlgorithm(QgsProcessingAlgorithm):
+    INPUT = 'INPUT'
+    ELEVATION_FIELD = 'ELEVATION_FIELD'
+    SLOPE_THRESHOLD = 'SLOPE_THRESHOLD'
+    RADIUS_THRESHOLD = 'RADIUS_THRESHOLD'
+    ELEVATION_CLASS_INTERVAL = 'ELEVATION_CLASS_INTERVAL'
+    NORMALIZE = 'NORMALIZE'
+    OUTPUT_FILE = 'OUTPUT_FILE'
+    EXPORT_DATA_FILE = 'EXPORT_DATA_FILE'
+
+    def tr(self, string):
+        return QCoreApplication.translate('CalculateCaveLevelsAlgorithm', string)
+
+    def initAlgorithm(self, config=None):
+        self.addParameter(
+            QgsProcessingParameterFeatureSource(
+                self.INPUT,
+                self.tr('Input Shapefile'),
+                [QgsProcessing.TypeVectorPoint]
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterField(
+                self.ELEVATION_FIELD,
+                self.tr('Elevation Field'),
+                parentLayerParameterName=self.INPUT,
+                type=QgsProcessingParameterField.Numeric
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.SLOPE_THRESHOLD,
+                self.tr('Slope Threshold (degrees)'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=15.0
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.RADIUS_THRESHOLD,
+                self.tr('Radius Threshold (meters)'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=50.0
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.ELEVATION_CLASS_INTERVAL,
+                self.tr('Elevation Class Interval (meters)'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=10.0
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.NORMALIZE,
+                self.tr('Normalize Horizontal Extents'),
+                defaultValue=False
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterFileDestination(
+                self.OUTPUT_FILE,
+                self.tr('Output File (PNG)'),
+                fileFilter='PNG files (*.png)'
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterFileDestination(
+                self.EXPORT_DATA_FILE,
+                self.tr('Export Plot Data (TXT)'),
+                fileFilter='Text files (*.txt)'
+            )
+        )
+
+    def processAlgorithm(self, parameters, context, feedback):
+        input_layer = self.parameterAsSource(parameters, self.INPUT, context)
+        elevation_field = self.parameterAsString(parameters, self.ELEVATION_FIELD, context)
+        slope_threshold = self.parameterAsDouble(parameters, self.SLOPE_THRESHOLD, context)
+        radius_threshold = self.parameterAsDouble(parameters, self.RADIUS_THRESHOLD, context)
+        elevation_class_interval = self.parameterAsDouble(parameters, self.ELEVATION_CLASS_INTERVAL, context)
+        normalize = self.parameterAsBoolean(parameters, self.NORMALIZE, context)
+        output_file = self.parameterAsFileOutput(parameters, self.OUTPUT_FILE, context)
+        export_data_file = self.parameterAsFileOutput(parameters, self.EXPORT_DATA_FILE, context)
+
+        if input_layer is None:
+            raise QgsProcessingException(self.tr("Invalid input layer"))
+
+        # Read the shapefile
+        feedback.pushInfo('Reading input layer...')
+        features = list(input_layer.getFeatures())
+        coords = []
+
+        for feature in features:
+            geom = feature.geometry()
+            if not geom.isEmpty():
+                x, y = geom.asPoint()
+                z = feature[elevation_field]
+                coords.append((x, y, z))
+
+        if not coords:
+            raise QgsProcessingException(self.tr("No valid points found in the input layer"))
+
+        coords = np.array(coords)
+
+        # Calculate horizontal extents 
+        feedback.pushInfo('Calculating horizontal extents...')
+        level_lengths = []
+        excluded_points = 0  # Track the number of excluded points
+
+        for i in range(len(coords) - 1):
+            x1, y1, z1 = coords[i]
+            x2, y2, z2 = coords[i + 1]
+
+            dx = x2 - x1
+            dy = y2 - y1
+            dz = z2 - z1
+
+            horizontal_distance = math.sqrt(dx**2 + dy**2)
+            slope = math.degrees(math.atan2(dz, horizontal_distance))
+
+            # Check if the conditions are met
+            if (horizontal_distance <= radius_threshold) and (abs(slope) <= slope_threshold):
+                midpoint_elevation = (z1 + z2) / 2
+                level_lengths.append((midpoint_elevation, horizontal_distance))
+            else:
+                excluded_points += 1  # Increment excluded points count
+
+        # Grouping by elevation classes
+        feedback.pushInfo('Grouping by elevation classes...')
+        elevation_classes = {}
+        for elevation, length in level_lengths:
+            class_lower = (elevation // elevation_class_interval) * elevation_class_interval
+            class_upper = class_lower + elevation_class_interval
+            class_key = f"{int(class_lower)}-{int(class_upper)}m"
+
+            if class_key not in elevation_classes:
+                elevation_classes[class_key] = 0
+            elevation_classes[class_key] += length
+
+        # Ensuring all elevation classes are represented
+        feedback.pushInfo('Ensuring all elevation classes are represented...')
+        min_elevation = math.floor(coords[:, 2].min() / elevation_class_interval) * elevation_class_interval
+        max_elevation = math.ceil(coords[:, 2].max() / elevation_class_interval) * elevation_class_interval
+
+        for elevation in range(int(min_elevation), int(max_elevation) + 1, int(elevation_class_interval)):
+            class_lower = elevation
+            class_upper = elevation + elevation_class_interval
+            class_key = f"{int(class_lower)}-{int(class_upper)}m"
+            if class_key not in elevation_classes:
+                elevation_classes[class_key] = 0
+
+        # Sort elevation classes and corresponding lengths
+        sorted_classes = sorted(
+            zip(elevation_classes.keys(), elevation_classes.values()),
+            key=lambda x: int(x[0].split('-')[0])  # Sort by the lower bound of the elevation class, treated as int
+        )
+        class_labels, class_lengths = zip(*sorted_classes)
+
+        # Plot histogram
+        feedback.pushInfo('Generating histogram...')
+        plt.figure(figsize=(12, 6))
+
+        # Normalize class_lengths if the parameter is enabled
+        if normalize:
+            max_length = max(class_lengths)
+            class_lengths = [length / max_length for length in class_lengths]
+            plt.xlabel('Normalized Horizontal Extent (0-1)')
+        else:
+            plt.xlabel('Horizontal Extent (meters)')
+
+        plt.barh(class_labels, class_lengths, color='skyblue', edgecolor='black')
+        plt.ylabel('Elevation Classes (meters)')
+        plt.title('Horizontal Extent vs Elevation Classes')
+        plt.grid(True, linestyle='--', alpha=0.7)
+
+        # Save the plot
+        plt.savefig(output_file)
+        plt.close()
+        feedback.pushInfo(f'Plot saved to {output_file}')
+
+        # Export data to a text file
+        feedback.pushInfo(f'Exporting data to {export_data_file}...')
+        with open(export_data_file, 'w') as f:
+            f.write("Elevation Class (m)\tHorizontal Extent\n")
+            for class_label, class_length in zip(class_labels, class_lengths):
+                f.write(f"{class_label}\t{class_length:.2f}\n")
+        feedback.pushInfo(f'Data exported to {export_data_file}')
+
+        #  Validation Summary
+        total_input_points = len(coords)
+        elevation_range = f"{min(coords[:, 2]):.2f} - {max(coords[:, 2]):.2f} meters"
+        total_horizontal_extent = sum(class_lengths)
+        missing_classes = [
+            f"{int(min_elevation) + i * elevation_class_interval}-{int(min_elevation) + (i + 1) * elevation_class_interval}m"
+            for i in range(int((max_elevation - min_elevation) / elevation_class_interval))
+            if f"{int(min_elevation) + i * elevation_class_interval}-{int(min_elevation) + (i + 1) * elevation_class_interval}m" 
+               not in elevation_classes
+        ]
+
+        # Display the validation summary in QGIS interface
+        feedback.pushInfo("\nExport Validation Summary:")
+        feedback.pushInfo(f"Total Input Points: {total_input_points}")
+        feedback.pushInfo(f"Elevation Range: {elevation_range}")
+        feedback.pushInfo(f"Total Horizontal Extent: {total_horizontal_extent:.2f} meters")
+        feedback.pushInfo(f"Points Excluded (did not meet radius or slope thresholds): {excluded_points}")
+        return {}
+
+    def name(self):
+        return 'calculatecavelevels'
+
+    def displayName(self):
+        return self.tr('Calculate Cave Levels')
+
+    def group(self):
+        return self.tr('Cave Analysis')
+
+    def groupId(self):
+        return 'caveanalysis'
+
+    def shortHelpString(self):
+        return self.tr(""" 
+        This algorithm calculates cave levels and horizontal extents based on elevation, excluding distances with slopes outside a user-defined threshold and segments exceeding a specified radius. The user can define elevation class intervals for grouping. Data will be exported unsorted to a text file.
+        
+        Note: The calculations are only valid for Metric coordinate systems. Ensure the cave survey is reprojected to a Metric coordinate system if it is not initially set up as such.
+        """)
+
+    def createInstance(self):
+        return CalculateCaveLevelsAlgorithm()
