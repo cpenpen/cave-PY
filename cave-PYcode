@@ -235,7 +235,9 @@ class CalculateCaveLevelsAlgorithm(QgsProcessingAlgorithm):
         return self.tr(""" 
         This algorithm calculates cave levels and horizontal extents based on elevation, excluding distances with slopes outside a user-defined threshold and segments exceeding a specified radius. The user can define elevation class intervals for grouping. Data will be exported unsorted to a text file.
         
-        Note: The calculations are only valid for Metric coordinate systems. Ensure the cave survey is reprojected to a Metric coordinate system if it is not initially set up as such.
+        Note: The calculations are only valid for Metric coordinate systems. Ensure the cave survey is reprojected to a Metric coordinate system if it is not initially set up as such. 
+
+        If you are using the code please cite as follows: Pennos, C., & Øvrevik Skoglund, R. (2025). Cave-PY a QGIS plugin to identify cave levels from geospatially referenced cave surveys. Acta Carsologica, 54(1). https://doi.org/10.3986/ac.v54i1.14294
         """)
 
     def createInstance(self):
